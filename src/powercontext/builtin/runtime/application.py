@@ -143,6 +143,7 @@ from powercontext.builtin.persistence.artifact_governance import (
     ArtifactGovernance,
     ArtifactLifecycleState,
 )
+from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.skill_publications import SkillPublication
 from powercontext.builtin.publication import ArtifactPublicationApplication
 from powercontext.builtin.records import (
@@ -249,6 +250,7 @@ from powercontext.builtin.runtime.recall_sufficiency import (
     build_recall_candidates,
     recall_effort,
 )
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication, SourceLifecycleError
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
 from powercontext.builtin.scope.subject_sources import SubjectSourceService
@@ -2563,6 +2565,29 @@ class ScopedMemoryApplication:
                 entry=_entry_record(updated, revised),
             )
 
+    async def _sync_source_lifecycle(self, desired: dict[str, tuple[str, bool]]) -> None:
+        # The caller holds the scope writer lock across lifecycle publication.
+        async with self._runtime._context(
+            self.scope_id, embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING
+        ) as context:
+            service = context.artifacts.memory
+            current = await service.head(context.artifacts.memory_artifact_id)
+            entries = {entry.entry_id: entry for entry in await service.entries(current)}
+            states = {item.entry_id: item.state for item in current.content.manifest.entries}
+            activate, deactivate = [], []
+            for entry_id, (version, available) in desired.items():
+                entry = entries.get(entry_id)
+                if entry is None or entry.entry_version_id != version:
+                    raise SourceLifecycleError("registered Memory body is no longer current")  # noqa: TRY003
+                if available and states[entry_id] != "active":
+                    activate.append(entry)
+                elif not available and states[entry_id] == "active":
+                    deactivate.append(entry)
+            if deactivate:
+                current = await service.forget(current, entries=deactivate, reason="Source lifecycle withdrawal")
+            if activate:
+                await service.reactivate(current, entries=activate, reason="Source lifecycle restoration")
+
     async def retire(self, request: RetireMemoryEntryRequest, /) -> MemoryMutationResult:
         async with self._runtime._context(
             self.scope_id,
@@ -2990,6 +3015,7 @@ class BuiltinRuntime:
         self,
         *,
         provider: PowerContextProvider[BuiltinSources, BuiltinArtifacts, BuiltinTriggers],
+        lifecycle_database: AsyncDatabase | None = None,
         capabilities: RuntimeCapabilities,
         code_service: CodeService | None = None,
         source_window_limit: int = 100,
@@ -3117,6 +3143,7 @@ class BuiltinRuntime:
         self.ingestion = RemoteIngestionApplication(self, remote_ingestion)
         self.code = CodeApplication(self, code_service or CodeService(CodeConfig()))
         self.context = ContextApplication(self)
+        self.lifecycle = SourceLifecycleApplication(self, lifecycle_database)
         self.experience = ExperienceApplication(self)
         self.dream = DreamApplication(self)
         self.external_skills = ExternalSkillApplication(self)
