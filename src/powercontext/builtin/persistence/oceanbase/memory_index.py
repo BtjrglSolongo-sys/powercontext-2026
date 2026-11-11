@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pyobvector import VECTOR, VectorIndex
 from sqlalchemy import (
     BigInteger,
@@ -31,6 +33,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.mysql import match
 from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.sql import Select
+from sqlalchemy.sql.elements import TextClause
 
 from powercontext.artifacts import ArtifactRef
 from powercontext.builtin.artifacts.memory import (
@@ -156,56 +160,39 @@ class OceanBaseMemoryFTSIndex:
     ) -> MemorySearchChannels:
         if request.mode not in {"fts", "hybrid"}:
             return MemorySearchChannels()
-        score = match(MEMORY_ENTRY_HEADS_TABLE.c.searchable_text, against=request.analyzed_query)
-        rows = (
-            await connection.execute(
-                select(
-                    MEMORY_ENTRY_HEADS_TABLE.c.memory_artifact_id,
-                    MEMORY_ENTRY_HEADS_TABLE.c.head_revision,
-                    MEMORY_ENTRY_HEADS_TABLE.c.entry_id,
-                    MEMORY_ENTRY_HEADS_TABLE.c.entry_version_id,
-                    MEMORY_ENTRY_VERSIONS_TABLE.c.text,
-                )
-                .join(
-                    MEMORY_ENTRY_VERSIONS_TABLE,
-                    (MEMORY_ENTRY_VERSIONS_TABLE.c.scope_id == MEMORY_ENTRY_HEADS_TABLE.c.scope_id)
-                    & (
-                        MEMORY_ENTRY_VERSIONS_TABLE.c.memory_artifact_id
-                        == MEMORY_ENTRY_HEADS_TABLE.c.memory_artifact_id
-                    )
-                    & (MEMORY_ENTRY_VERSIONS_TABLE.c.entry_version_id == MEMORY_ENTRY_HEADS_TABLE.c.entry_version_id),
-                )
-                .where(
-                    MEMORY_ENTRY_HEADS_TABLE.c.scope_id == scope_id,
-                    MEMORY_ENTRY_HEADS_TABLE.c.memory_artifact_id.in_(
-                        tuple(memory.artifact_id for memory in request.memories)
-                    ),
-                    score,
-                    *(
-                        ()
-                        if request.tag_filter is None
-                        else (
-                            tag_predicate(
-                                scope_id,
-                                "memory",
-                                MEMORY_ENTRY_HEADS_TABLE.c.memory_artifact_id,
-                                "memory_entry",
-                                MEMORY_ENTRY_HEADS_TABLE.c.entry_id,
-                                request.tag_filter,
-                            ),
-                        )
-                    ),
-                )
-                .order_by(
-                    score.desc(),
-                    MEMORY_ENTRY_HEADS_TABLE.c.memory_artifact_id,
-                    MEMORY_ENTRY_HEADS_TABLE.c.entry_id,
-                    MEMORY_ENTRY_HEADS_TABLE.c.entry_version_id,
-                )
-                .limit(request.candidate_limit)
-            )
-        ).mappings()
+        rows = (await connection.execute(self.candidates(scope_id, request))).mappings()
         return MemorySearchChannels(fts=memory_channel_hits(rows, request.memories))
+
+    @staticmethod
+    def candidates(scope_id: str, request: MemorySearchRequest, *, include_score: bool = False) -> Select[Any]:
+        heads = MEMORY_ENTRY_HEADS_TABLE.c
+        versions = MEMORY_ENTRY_VERSIONS_TABLE.c
+        score = match(heads.searchable_text, against=request.analyzed_query)
+        statement = (
+            select(heads.memory_artifact_id, heads.head_revision, heads.entry_id, heads.entry_version_id, versions.text)
+            .join(
+                MEMORY_ENTRY_VERSIONS_TABLE,
+                (versions.scope_id == heads.scope_id)
+                & (versions.memory_artifact_id == heads.memory_artifact_id)
+                & (versions.entry_version_id == heads.entry_version_id),
+            )
+            .where(
+                heads.scope_id == scope_id,
+                heads.memory_artifact_id.in_(tuple(memory.artifact_id for memory in request.memories)),
+                score,
+            )
+            .order_by(score.desc(), heads.memory_artifact_id, heads.entry_id, heads.entry_version_id)
+            .limit(request.candidate_limit)
+        )
+        if request.tag_filter is not None:
+            statement = statement.where(
+                tag_predicate(
+                    scope_id, "memory", heads.memory_artifact_id, "memory_entry", heads.entry_id, request.tag_filter
+                )
+            )
+        if include_score:
+            statement = statement.add_columns(score.label("score"))
+        return statement
 
     async def vector_complete(
         self,
@@ -373,26 +360,39 @@ class OceanBaseMemoryVectorIndex:
     ) -> MemorySearchChannels:
         if request.mode not in {"vector", "hybrid"}:
             return MemorySearchChannels()
+        parameters = await self.candidate_parameters(connection, scope_id, request)
+        rows = (
+            await connection.execute(
+                self._search_sql if request.tag_filter is None else self._tagged_search_sql,
+                parameters,
+            )
+        ).mappings()
+        return MemorySearchChannels(vector=memory_channel_hits(rows, request.memories))
+
+    async def candidate_parameters(
+        self, connection: AsyncConnection, scope_id: str, request: MemorySearchRequest
+    ) -> dict[str, Any]:
         if request.embedding_profile != self.profile or request.query_vector is None:
             raise CapabilityNotSupportedError("embedding-profile")
         if not await self.vector_complete(connection, scope_id, request.memories, self.profile):
             raise CapabilityNotSupportedError("vector")
-        rows = (
-            await connection.execute(
-                self._search_sql if request.tag_filter is None else self._tagged_search_sql,
-                {
-                    "scope_id": scope_id,
-                    "memory_artifact_ids": tuple(memory.artifact_id for memory in request.memories),
-                    "query_vector": validate_embedding(
-                        request.query_vector,
-                        dimension=self.profile.dimension,
-                    ),
-                    "candidate_limit": request.candidate_limit,
-                    **memory_tag_parameters(request.tag_filter),
-                },
-            )
-        ).mappings()
-        return MemorySearchChannels(vector=memory_channel_hits(rows, request.memories))
+        return {
+            "scope_id": scope_id,
+            "memory_artifact_ids": tuple(memory.artifact_id for memory in request.memories),
+            "query_vector": validate_embedding(request.query_vector, dimension=self.profile.dimension),
+            "candidate_limit": request.candidate_limit,
+            **memory_tag_parameters(request.tag_filter),
+        }
+
+    def approximate_candidates(self, *, tagged: bool) -> TextClause:
+        if not tagged:
+            return self._search_sql
+        return text(_OCEANBASE_VECTOR_SEARCH_SQL.replace("ORDER BY", memory_tag_sql("m") + "ORDER BY")).bindparams(
+            bindparam("memory_artifact_ids", expanding=True),
+            bindparam("tag_keys", expanding=True),
+            bindparam("tag_hashes", expanding=True),
+            bindparam("query_vector", type_=VECTOR(self.profile.dimension)),
+        )
 
     async def vector_complete(
         self,
