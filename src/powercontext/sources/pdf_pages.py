@@ -69,6 +69,16 @@ class PDFPageSource(Source, PDFPageInput):
         return self.name
 
 
+_LIGATURES = str.maketrans({chr(code): unicodedata.normalize("NFKC", chr(code)) for code in range(0xFB00, 0xFB07)})
+
+
+def _normalize_pdf_text(text: str) -> str:
+    # Keep table numbers and ordinary hyphens; these replacements only undo
+    # typographic ligatures and discretionary hyphenation in the text layer.
+    text = re.sub(r"(?<=\w)\u00ad[ \t]*\r?\n[ \t]*(?=\w)", "", text)
+    return unicodedata.normalize("NFC", text.translate(_LIGATURES).replace("\u00ad", "")).strip()
+
+
 def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
     """Extract every physical page before publishing any results."""
     from pypdf import PdfReader
@@ -85,7 +95,7 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
                 document_id=value.document_id,
                 document_sha256=digest,
                 page_number=number,
-                text=unicodedata.normalize("NFC", page.extract_text() or ""),
+                text=_normalize_pdf_text(page.extract_text() or ""),
             )
             for number, page in enumerate(reader.pages, start=1)
         )
@@ -146,29 +156,60 @@ _STOP = frozenset(
     "they this those to up us usd use used using was were what when where whether which who will with would year".split()
 )
 # Financial questions often use terminology that differs from the report's row or section heading.
+_INCOME_STATEMENT = (
+    "income statement",
+    "statement of income",
+    "statements of income",
+    "statement of earnings",
+    "statements of earnings",
+    "statement of operations",
+    "statement of profit or loss",
+    "statements of operations",
+    "profit and loss",
+    "p l statement",
+)
+_CASH_FLOW_STATEMENT = (
+    "cash flow statement",
+    "statement of cash flow",
+    "statements of cash flow",
+)
+_BALANCE_SHEET = ("balance sheet", "statement of financial position", "statements of financial position")
 _CONCEPTS = (
-    (
-        "income statement",
-        "statement of income",
-        "statements of income",
-        "statement of earnings",
-        "statements of operations",
-        "profit and loss",
-        "p l statement",
-        "results of operations",
-    ),
-    ("cash flow statement", "statement of cash flow", "statements of cash flow", "cash flow from operating"),
-    ("balance sheet", "statement of financial position", "statements of financial position"),
+    _INCOME_STATEMENT,
+    _CASH_FLOW_STATEMENT,
+    _BALANCE_SHEET,
     ("capital expenditure", "capex", "capital spending", "purchase of property", "addition to property"),
     ("depreciation and amortization", "depreciation amortization", "d a"),
     ("operating income", "operating profit", "income from operation", "earnings from operation"),
     ("net income", "net earning", "net profit"),
     ("revenue", "net sales", "net revenue", "turnover"),
-    ("geograph", "geography", "geographic", "geographic region", "country", "international operation"),
+    (
+        "geography",
+        "geographic",
+        "geographic region",
+        "country",
+        "international operation",
+        "principal market",
+        "geographic information",
+        "description of business",
+    ),
     ("business segment", "operating segment", "reportable segment", "segment information"),
     ("legal battle", "legal proceeding", "legal matter", "litigation", "lawsuit", "legal contingency"),
     ("restructuring cost", "restructuring charge", "restructuring expense", "restructuring and impairment"),
     ("share repurchase", "stock repurchase", "share buyback", "treasury stock"),
+    ("working capital", "current asset", "current liability"),
+    ("research and development", "r d", "research development"),
+    ("inventory", "inventories", "merchandise inventory"),
+    ("account receivable", "trade receivable", "receivable"),
+    ("account payable", "trade payable", "payable"),
+    ("interest expense", "interest cost", "finance cost"),
+    ("income tax", "tax expense", "tax provision", "effective tax rate"),
+    ("dividend", "distribution to shareholder"),
+    ("goodwill impairment", "impairment of goodwill", "goodwill"),
+    ("debt maturity", "maturity of debt", "scheduled maturity"),
+    ("gross margin", "gross profit", "cost of sale", "cost of revenue", "cost of good sold"),
+    ("free cash flow", "cash from operation", "net cash provided by operating activities"),
+    ("selling general and administrative", "selling and administrative", "sg a", "s g a"),
 )
 
 
@@ -184,6 +225,27 @@ def _terms(text: str) -> list[str]:
     ]
 
 
+# These metrics often require inputs from multiple statements even when
+# the question names only the metric.
+_METRIC_STATEMENTS = (
+    (("ebitda", "capital intensity"), (_INCOME_STATEMENT, _CASH_FLOW_STATEMENT)),
+    (("free cash flow",), (_CASH_FLOW_STATEMENT,)),
+    (("current ratio", "quick ratio", "debt to equity", "net debt", "working capital"), (_BALANCE_SHEET,)),
+    (
+        (
+            "asset turnover",
+            "return on asset",
+            "return on equity",
+            "days sales outstanding",
+            "days payable outstanding",
+            "inventory turnover",
+            "cash conversion cycle",
+        ),
+        (_INCOME_STATEMENT, _BALANCE_SHEET),
+    ),
+)
+
+
 def _phrase(phrase: str, text: str) -> bool:
     return f" {phrase} " in text
 
@@ -194,6 +256,7 @@ class _SearchPage:
     source_ids: tuple[str, ...]
     document: str
     terms: list[str]
+    headings: tuple[str, ...]
 
 
 def _page_candidates(records: tuple[MemoryEntryRecord, ...]) -> list[_SearchPage]:
@@ -203,46 +266,97 @@ def _page_candidates(records: tuple[MemoryEntryRecord, ...]) -> list[_SearchPage
         if not ids:
             continue
         document, _, text = record.entry.text.partition("\n")
-        pages.append(_SearchPage(record, ids, document, _terms(text)))
+        lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and line.strip().casefold() not in {"table of contents", "contents"}
+        ]
+        headings = tuple(
+            " " + " ".join(_terms(line)) + " " if len(line) <= 100 and not line.endswith(".") else ""
+            for line in lines[:6]
+        )
+        pages.append(_SearchPage(record, ids, document, _terms(text), headings))
     return pages
 
 
 def _rank(pages: list[_SearchPage], query: list[str], native: dict[str, int]) -> list[_SearchPage]:
     words = set(query) - _STOP
     question = " " + " ".join(query) + " "
-    concepts = [tuple(" ".join(_terms(alias)) for alias in aliases) for aliases in _CONCEPTS]
-    concepts = [aliases for aliases in concepts if any(_phrase(alias, question) for alias in aliases)]
+    relevant = set()
+    for metrics, statements in _METRIC_STATEMENTS:
+        if any(_phrase(" ".join(_terms(metric)), question) for metric in metrics):
+            relevant.update(statements)
+    concepts = []
+    for group in _CONCEPTS:
+        aliases = tuple(" ".join(_terms(alias)) for alias in group)
+        if group in relevant or any(_phrase(alias, question) for alias in aliases):
+            concepts.append(aliases)
     document_words = {page.document: set(_terms(page.document)) for page in pages}
-    query_years = {word for word in words if word.isdecimal() and len(word) == 4}
+    years = {word for word in words if word.isdecimal() and 1900 <= int(word) <= 2099}
+    boilerplate = {"annual", "report", "form", "fy", "k", "q", "quarter"}
     companies = {
-        document: len((terms - _STOP) & {word for word in words if word.isalpha() and word not in {"fy", "k", "q"}})
+        document: len((terms - _STOP - boilerplate) & {word for word in words if word.isalpha()})
         for document, terms in document_words.items()
     }
     best_company = max(companies.values(), default=0)
+    best_year = any(companies[doc] == best_company and terms & years for doc, terms in document_words.items())
+    document_preference = {
+        doc: (2.0 if companies[doc] == best_company else 0.55) * (1.5 if not best_year or terms & years else 0.72)
+        for doc, terms in document_words.items()
+    }
+    title_terms = set().union(*document_words.values())
     counters = [Counter(page.terms) for page in pages]
     frequency = Counter(word for counts in counters for word in words & counts.keys())
     average = max(1.0, sum(len(page.terms) for page in pages) / len(pages))
-    weights = {word: math.log1p((len(pages) - frequency[word] + 0.5) / (frequency[word] + 0.5)) for word in words}
-    pairs = {f"{a} {b}" for a, b in pairwise(query) if a in words and b in words}
-    ranked = []
+    weights = {
+        word: math.log1p((len(pages) - frequency[word] + 0.5) / (frequency[word] + 0.5))
+        * (0.15 if word in years or word in title_terms else 1.0)
+        for word in words
+    }
+    pairs = {f"{a} {b}" for a, b in pairwise(query) if a in words - years and b in words - years}
+    base = []
+    signals = []
     for page, counts in zip(pages, counters, strict=True):
         body = " " + " ".join(page.terms) + " "
-        heading = " " + " ".join(page.terms[:75]) + " "
         norm = 0.65 + 0.55 * len(page.terms) / average
-        score = math.fsum(weights[word] * counts[word] / (counts[word] + norm) for word in words)
-        score += 1.25 * sum(_phrase(pair, body) for pair in pairs)
+        lexical = math.fsum(weights[word] * counts[word] / (counts[word] + norm) for word in words)
+        lexical += 1.2 * sum(_phrase(pair, body) for pair in pairs)
+        lexical += 0.4 / (1 + native.get(page.record.entry.entry_id, 999))
+        matches = []
         for aliases in concepts:
-            if any(_phrase(alias, body) for alias in aliases):
-                score += 2.5
-            if any(_phrase(alias, heading) for alias in aliases):
-                score += 3.0
-        if page.terms:
-            score += 1.8 * bool(document_words[page.document] & query_years)
-            score += 0.45 / (1 + native.get(page.record.entry.entry_id, 999))
-        if best_company and companies[page.document] < best_company:
-            score *= 0.42
-        ranked.append((score, page))
-    return [page for _, page in sorted(ranked, key=lambda item: -item[0])]
+            matched = any(_phrase(alias, body) for alias in aliases)
+            # Short titles identify the statement itself. A passing reference
+            # in a table of contents or audit opinion is weaker evidence.
+            heading = any(
+                len(line.split()) <= len(alias.split()) + 5 and not line.split()[-1].isdigit() and _phrase(alias, line)
+                for alias in aliases
+                for line in page.headings
+                if line.strip()
+            )
+            matches.append(3.0 if heading else 1.0 if matched else 0.0)
+        preference = document_preference[page.document]
+        base.append((lexical + 1.6 * sum(matches)) * preference if page.terms else -1.0)
+        signals.append((matches, lexical, preference))
+
+    # Reserve room for distinct parts of the question. Ranking only by the
+    # whole question lets pages that mention many metrics crowd out the
+    # original statement that provides just one of the required inputs.
+    overall = sorted(range(len(pages)), key=lambda index: -base[index])
+    lanes = [
+        sorted(
+            (i for i, (matches, _, _) in enumerate(signals) if matches[concept]),
+            key=lambda i: (
+                -signals[i][0][concept] * signals[i][2],
+                -signals[i][1] * signals[i][2],
+            ),
+        )
+        for concept in range(len(concepts))
+    ]
+    order = dict.fromkeys(overall[:3])
+    for depth in range(2):
+        order.update(dict.fromkeys(lane[depth] for lane in lanes if len(lane) > depth))
+    order.update(dict.fromkeys(overall))
+    return [pages[index] for index in order]
 
 
 async def search_pdf_pages(
