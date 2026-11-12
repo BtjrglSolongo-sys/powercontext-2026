@@ -359,6 +359,26 @@ def _rank(pages: list[_SearchPage], query: list[str], native: dict[str, int]) ->
     return [pages[index] for index in order]
 
 
+def _requested_documents(pages: list[_SearchPage], question: str) -> list[_SearchPage]:
+    """Resolve explicit report identifiers before ranking pages across reports."""
+    query = set(_terms(question))
+    ignored = _STOP | {"annual", "report", "form", "fy", "k", "q", "inc", "corp", "corporation", "company"}
+    documents = {page.document: set(_terms(page.document)) for page in pages}
+    matches = {
+        document: len({term for term in terms & query - ignored if term.isalpha() and len(term) > 1})
+        for document, terms in documents.items()
+    }
+    best = max(matches.values(), default=0)
+    if not best:
+        return pages
+    selected = {document for document, count in matches.items() if count == best}
+    years = {term for term in query if term.isdecimal() and len(term) == 4}
+    dated = {document for document in selected if documents[document] & years}
+    if dated:
+        selected = dated
+    return [page for page in pages if page.document in selected]
+
+
 async def search_pdf_pages(
     memory: ScopedMemoryApplication, question: str, limit: int = 10
 ) -> tuple[MemoryCitation, ...]:
@@ -378,7 +398,7 @@ async def search_pdf_pages(
         return ()
     seen: set[str] = set()
     citations = []
-    for page in _rank(pages, query, native):
+    for page in _rank(_requested_documents(pages, question), query, native):
         if seen.intersection(page.source_ids):
             continue
         seen.update(page.source_ids)
